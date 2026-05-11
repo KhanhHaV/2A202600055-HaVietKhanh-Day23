@@ -52,5 +52,15 @@ def validate_metrics(metrics: Annotated[Path, typer.Option("--metrics")]) -> Non
     typer.echo(f"Metrics valid. success_rate={report.success_rate:.2%}")
 
 
+@app.command("draw-graph")
+def draw_graph(output: Annotated[Path, typer.Option("--output")] = Path("graph_diagram.md")) -> None:
+    """Export graph diagram as Mermaid markdown."""
+    graph = build_graph()
+    mermaid = graph.get_graph().draw_mermaid()
+    content = f"```mermaid\n{mermaid}\n```"
+    output.write_text(content, encoding="utf-8")
+    typer.echo(f"Wrote graph diagram to {output}")
+
+
 if __name__ == "__main__":
     app()

@@ -10,38 +10,61 @@ from .state import AgentState, ApprovalDecision, Route, make_event
 
 
 def intake_node(state: AgentState) -> dict:
-    """Normalize raw query into state fields.
+    """Normalize raw query into state fields and mask PII."""
+    import re
 
-    TODO(student): add normalization, PII checks, and metadata extraction.
-    """
     query = state.get("query", "").strip()
+    # Simple PII mask for emails
+    masked_query = re.sub(r"[\w\.-]+@[\w\.-]+\.\w+", "[EMAIL]", query)
+    
     return {
-        "query": query,
-        "messages": [f"intake:{query[:40]}"],
-        "events": [make_event("intake", "completed", "query normalized")],
+        "query": masked_query,
+        "messages": [f"intake: {masked_query[:40]}..."],
+        "events": [make_event("intake", "completed", "query normalized and PII masked")],
     }
 
 
 def classify_node(state: AgentState) -> dict:
-    """Classify the query into a route.
+    """Classify the query into a route using keyword-based heuristics.
 
-    TODO(student): replace keyword heuristics with a clear routing policy.
-    Required routes: simple, tool, missing_info, risky, error.
+    Priority: RISKY > TOOL > MISSING_INFO > ERROR > SIMPLE
     """
+    import re
+
     query = state.get("query", "").lower()
-    words = query.split()
-    clean_words = [w.strip("?!.,;:") for w in words]
+    
+    # Define keywords
+    risky_keywords = {"refund", "delete", "send", "cancel", "remove", "revoke"}
+    tool_keywords = {"status", "order", "lookup", "check", "track", "find", "search"}
+    error_keywords = {"timeout", "fail", "failure", "error", "crash", "unavailable"}
+    
+    # Word boundary check helper
+    def contains_any(text, keywords):
+        for k in keywords:
+            if re.search(rf"\b{k}\b", text):
+                return True
+        return False
+
     route = Route.SIMPLE
     risk_level = "low"
-    if "refund" in query or "delete" in query or "send" in query:
+
+    # 1. RISKY (Highest Priority)
+    if contains_any(query, risky_keywords):
         route = Route.RISKY
         risk_level = "high"
-    elif "status" in query or "order" in query or "lookup" in query:
+    # 2. TOOL
+    elif contains_any(query, tool_keywords):
         route = Route.TOOL
-    elif len(clean_words) < 5 and "it" in clean_words:
-        route = Route.MISSING_INFO
-    elif "timeout" in query or "fail" in query:
-        route = Route.ERROR
+    # 3. MISSING_INFO
+    # Heuristic: < 5 words AND contains pronouns like "it"
+    else:
+        words = re.findall(rf"\b\w+\b", query)
+        if len(words) < 5 and "it" in words:
+            route = Route.MISSING_INFO
+        # 4. ERROR
+        elif contains_any(query, error_keywords):
+            route = Route.ERROR
+    
     return {
         "route": route.value,
         "risk_level": risk_level,
@@ -50,11 +73,13 @@ def classify_node(state: AgentState) -> dict:
 
 
 def ask_clarification_node(state: AgentState) -> dict:
-    """Ask for missing information instead of hallucinating.
-
-    TODO(student): generate a specific clarification question from state.
-    """
-    question = "Can you provide the order id or the missing context?"
+    """Ask for missing information instead of hallucinating."""
+    query = state.get("query", "")
+    if len(query.split()) < 3:
+        question = "I'm sorry, your request is too brief. Could you please provide more details about what you need help with?"
+    else:
+        question = "I understand you need help with something specific, but I need more details (like an order ID or specific error message) to proceed."
+    
     return {
         "pending_question": question,
         "final_answer": question,
@@ -80,13 +105,16 @@ def tool_node(state: AgentState) -> dict:
 
 
 def risky_action_node(state: AgentState) -> dict:
-    """Prepare a risky action for approval.
-
-    TODO(student): create a proposed action with evidence and risk justification.
-    """
+    """Prepare a risky action for approval."""
+    query = state.get("query", "")
+    risk_level = state.get("risk_level", "high")
+    
+    proposed_action = f"Execute high-impact action: {query}"
+    evidence = "Action involves sensitive financial or account data (refund/delete/send)."
+    
     return {
-        "proposed_action": "prepare refund or external action; approval required",
-        "events": [make_event("risky_action", "pending_approval", "approval required")],
+        "proposed_action": f"{proposed_action}. Reason: {evidence}",
+        "events": [make_event("risky_action", "pending_approval", f"approval required for {risk_level} risk")],
     }
 
 
@@ -134,14 +162,20 @@ def retry_or_fallback_node(state: AgentState) -> dict:
 
 
 def answer_node(state: AgentState) -> dict:
-    """Produce a final response.
-
-    TODO(student): ground the answer in tool_results and approval where relevant.
-    """
-    if state.get("tool_results"):
-        answer = f"I found: {state['tool_results'][-1]}"
+    """Produce a final response grounded in tool results."""
+    tool_results = state.get("tool_results", [])
+    approval = state.get("approval")
+    
+    if tool_results:
+        latest_result = tool_results[-1]
+        answer = f"Based on our internal tools, here is the result: {latest_result}"
+        if approval and approval.get("approved"):
+            answer += " (Action was approved by an administrator)"
+    elif state.get("pending_question"):
+        answer = state["pending_question"]
     else:
-        answer = "This is a safe mock answer. Replace with your agent response."
+        answer = "I've processed your request successfully."
+        
     return {
         "final_answer": answer,
         "events": [make_event("answer", "completed", "answer generated")],
@@ -149,13 +183,15 @@ def answer_node(state: AgentState) -> dict:
 
 
 def evaluate_node(state: AgentState) -> dict:
-    """Evaluate tool results — the 'done?' check that enables retry loops.
-
-    TODO(student): replace heuristic with LLM-as-judge or structured validation.
-    """
+    """Evaluate tool results to determine if a retry is needed."""
     tool_results = state.get("tool_results", [])
     latest = tool_results[-1] if tool_results else ""
-    if "ERROR" in latest:
+    
+    # Check for various error markers
+    error_markers = ["ERROR", "TIMEOUT", "FAILURE", "FAILED"]
+    needs_retry = any(marker in latest.upper() for marker in error_markers)
+    
+    if needs_retry:
         return {
             "evaluation_result": "needs_retry",
             "events": [make_event("evaluate", "completed", "tool result indicates failure, retry needed")],
@@ -167,14 +203,15 @@ def evaluate_node(state: AgentState) -> dict:
 
 
 def dead_letter_node(state: AgentState) -> dict:
-    """Log unresolvable failures for manual review.
-
-    Third layer of error strategy: retry -> fallback -> dead letter.
-    TODO(student): persist to dead-letter queue, alert on-call, or create support ticket.
-    """
+    """Log unresolvable failures for manual review."""
+    attempt = state.get("attempt", 0)
+    scenario_id = state.get("scenario_id", "unknown")
+    
+    final_msg = f"CRITICAL: Request {scenario_id} failed after {attempt} attempts. Escalating to manual support."
+    
     return {
-        "final_answer": "Request could not be completed after maximum retry attempts. Logged for manual review.",
-        "events": [make_event("dead_letter", "completed", f"max retries exceeded, attempt={state.get('attempt', 0)}")],
+        "final_answer": final_msg,
+        "events": [make_event("dead_letter", "completed", f"max retries exceeded, attempt={attempt}")],
     }
 
 
